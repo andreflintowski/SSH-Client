@@ -86,7 +86,7 @@ jobs:
         name: Archive and upload
         run: |
           # Surface xcodebuild errors as annotations, readable without the raw log.
-          trap 'grep -hE "error:|ERROR|Error Domain|No profiles|No signing" "$RUNNER_TEMP"/*.log 2>/dev/null | tail -15 | sed "s/^/::error::/"' ERR
+          trap 'cat "$RUNNER_TEMP"/*.log 2>/dev/null | grep -v "^ *export " | grep -E "error:|Error Domain|No profiles|No signing|requires a provisioning|\*\* .* FAILED" | tail -9 | sed "s/^/::error::/"' ERR
           set -o pipefail
           KEY_PATH="$RUNNER_TEMP/AuthKey_$KEY_ID.p8"
           printf '%s' "$KEY_P8" > "$KEY_PATH"
