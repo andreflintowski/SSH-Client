@@ -22,6 +22,14 @@ class HostsScreen extends StatelessWidget {
         listenable: repo,
         builder: (context, _) {
           final hosts = repo.hosts;
+          if (repo.loadError != null) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text("Couldn't load saved hosts:\n${repo.loadError}"),
+              ),
+            );
+          }
           if (hosts.isEmpty) {
             return const Center(child: Text('No hosts yet. Tap + to add one.'));
           }

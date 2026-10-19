@@ -3,11 +3,13 @@ import 'package:flutter/material.dart';
 import 'data/host_repository.dart';
 import 'screens/hosts_screen.dart';
 
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
   final repo = HostRepository();
-  await repo.load();
+  // Show the UI first: if loading fails or stalls, the app must not stay on
+  // the splash screen.
   runApp(SshApp(repo: repo));
+  repo.load();
 }
 
 class SshApp extends StatelessWidget {

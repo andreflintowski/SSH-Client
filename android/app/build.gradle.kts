@@ -34,6 +34,10 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // Shrinking breaks the plugins' Kotlin calls (NoSuchMethodError in
+            // shared_preferences at startup), so release builds stay unshrunk.
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
