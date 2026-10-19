@@ -128,6 +128,8 @@ jobs:
       - if: steps.check.outputs.ready == 'true'
         name: Archive and upload
         run: |
+          # The archive stays unsigned; export signs it with Apple's cloud-managed
+          # distribution certificate, so runs don't each create a certificate.
           # Surface xcodebuild errors as annotations, readable without the raw log.
           trap 'cat "$RUNNER_TEMP"/*.log 2>/dev/null | grep -v "^ *export " | grep -E "error:|Error Domain|No profiles|No signing|requires a provisioning|\*\* .* FAILED" | tail -9 | sed "s/^/::error::/"' ERR
           set -o pipefail
@@ -140,8 +142,8 @@ jobs:
           xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner \
             -configuration Release -destination generic/platform=iOS \
             -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
-            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic \
-            "${AUTH[@]}" archive 2>&1 | tee "$RUNNER_TEMP/archive.log"
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGNING_ALLOWED=NO \
+            archive 2>&1 | tee "$RUNNER_TEMP/archive.log"
           cat > "$RUNNER_TEMP/export.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

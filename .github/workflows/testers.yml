@@ -87,7 +87,7 @@ jobs:
           users = call("GET", "/users?limit=200")["data"]
           for u in users:
               a = u["attributes"]
-              print(f"::notice::User {a['username']} roles={','.join(a['roles'])}")
+              print(f"::notice::User roles={','.join(a['roles'])}")
 
           for group in internal:
               ga = group["attributes"]
@@ -97,7 +97,7 @@ jobs:
                   if not any(b["id"] == build["id"] for b in gb):
                       call("POST", f"/betaGroups/{group['id']}/relationships/builds",
                            {"data": [{"type": "builds", "id": build["id"]}]})
-                      print(f"::notice::Added build to group {ga['name']}")
+                      print("::notice::Added build to internal group")
               testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
               have = {t["attributes"].get("email", "").lower() for t in testers}
               for u in users:
@@ -106,17 +106,17 @@ jobs:
                       call("POST", "/betaTesters", {"data": {"type": "betaTesters",
                           "attributes": {"email": a["username"], "firstName": a["firstName"], "lastName": a["lastName"]},
                           "relationships": {"betaGroups": {"data": [{"type": "betaGroups", "id": group["id"]}]}}}})
-                      print(f"::notice::Added tester {a['username']} to {ga['name']}")
+                      print("::notice::Added a tester")
               testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
               for t in testers:
                   ta = t["attributes"]
-                  print(f"::notice::Group {ga['name']} (all builds: {ga.get('hasAccessToAllBuilds')}) tester {ta.get('email')} state={ta.get('state')}")
+                  print(f"::notice::Internal group (all builds: {ga.get('hasAccessToAllBuilds')}) tester state={ta.get('state')}")
                   # Re-send the TestFlight invite email.
                   try:
                       call("POST", "/betaTesterInvitations", {"data": {"type": "betaTesterInvitations", "relationships": {
                           "app": {"data": {"type": "apps", "id": app}},
                           "betaTester": {"data": {"type": "betaTesters", "id": t["id"]}}}}})
-                      print(f"::notice::Sent invite to {ta.get('email')}")
+                      print("::notice::Sent invite")
                   except SystemExit:
                       pass
           PY
