@@ -1,6 +1,7 @@
 name: Android launch check
 
 # Builds the APK, installs it on an emulator, opens it and reports what the app logs.
+# Runs whenever the app code changes.
 on:
   push:
     paths: ['.github/workflows/android-check.yml', 'lib/**', 'android/**']
