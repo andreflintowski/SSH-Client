@@ -42,7 +42,7 @@ jobs:
           sed 's/^/::notice::step /' steps.txt 2>/dev/null || true
           echo "::notice::pid=$(cat pid.txt 2>/dev/null) focus=$(tr '\n' ' ' < focus.txt 2>/dev/null)"
           grep -o 'text="[^"]*"' ui.txt 2>/dev/null | sort -u | head -20 | tr '\n' ' ' | sed 's/^/::notice::ui /'; echo
-          grep -E ' (E|F) |flutter|AndroidRuntime|FATAL|Exception' logcat.txt | grep -v -E 'chatty|GoogleApiManager|Finsky|gms' | tail -40 | while IFS= read -r l; do echo "::warning::$l"; done
+          cat applog.txt flutter.txt 2>/dev/null | grep -v -E '^-----|chatty' | sort -u | tail -45 | while IFS= read -r l; do echo "::warning::$l"; done
       - if: always()
         uses: actions/upload-artifact@v4
         with:

@@ -7,6 +7,9 @@ log "launch: $(adb shell monkey -p dev.andre.ssh_client -c android.intent.catego
 sleep 40
 adb logcat -d > logcat.txt 2>&1
 adb shell dumpsys window 2>&1 | grep -E 'mCurrentFocus|mFocusedApp' > focus.txt
-adb shell pidof dev.andre.ssh_client > pid.txt 2>&1 || echo none > pid.txt
+pid=$(adb shell pidof dev.andre.ssh_client)
+echo "${pid:-none}" > pid.txt
+[ -n "$pid" ] && adb logcat -d --pid="$pid" > applog.txt 2>&1
+adb logcat -d | grep -i -E 'flutter|AndroidRuntime|ssh_client' > flutter.txt
 adb shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1; adb shell cat /sdcard/ui.xml > ui.txt 2>&1
 exit 0
