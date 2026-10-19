@@ -78,11 +78,16 @@ jobs:
           cache: true
       - if: steps.check.outputs.ready == 'true'
         run: |
-          flutter pub get
-          flutter build ios --release --config-only --no-codesign --build-number="$GITHUB_RUN_NUMBER"
+          trap 'tail -15 "$RUNNER_TEMP/config.log" | sed "s/^/::error::/"' ERR
+          set -o pipefail
+          flutter pub get 2>&1 | tee "$RUNNER_TEMP/config.log"
+          flutter build ios --release --config-only --no-codesign --build-number="$GITHUB_RUN_NUMBER" 2>&1 | tee -a "$RUNNER_TEMP/config.log"
       - if: steps.check.outputs.ready == 'true'
         name: Archive and upload
         run: |
+          # Surface xcodebuild errors as annotations, readable without the raw log.
+          trap 'grep -hE "error:|ERROR|Error Domain|No profiles|No signing" "$RUNNER_TEMP"/*.log 2>/dev/null | tail -15 | sed "s/^/::error::/"' ERR
+          set -o pipefail
           KEY_PATH="$RUNNER_TEMP/AuthKey_$KEY_ID.p8"
           printf '%s' "$KEY_P8" > "$KEY_PATH"
           AUTH=(-allowProvisioningUpdates
@@ -93,7 +98,7 @@ jobs:
             -configuration Release -destination generic/platform=iOS \
             -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic \
-            "${AUTH[@]}" archive
+            "${AUTH[@]}" archive 2>&1 | tee "$RUNNER_TEMP/archive.log"
           cat > "$RUNNER_TEMP/export.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -106,7 +111,7 @@ jobs:
           PLIST
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export.plist" \
-            -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}"
+            -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}" 2>&1 | tee "$RUNNER_TEMP/export.log"
           rm -f "$KEY_PATH"
 
   # One fixed download page: github.com/<repo>/releases/latest
