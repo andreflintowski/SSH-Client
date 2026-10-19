@@ -176,7 +176,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release delete latest --cleanup-tag --yes || true
-          gh release create latest SSH.apk SSH.ipa \
-            --target "$GITHUB_SHA" \
-            --title "SSH (сборка ${GITHUB_RUN_NUMBER})" \
-            --notes "Android: скачайте SSH.apk на телефон и откройте его. iPhone: SSH.ipa."
+          # The deleted tag can linger for a moment, so retry the create.
+          for i in 1 2 3 4 5; do
+            gh release create latest SSH.apk SSH.ipa \
+              --target "$GITHUB_SHA" \
+              --title "SSH (сборка ${GITHUB_RUN_NUMBER})" \
+              --notes "Android: скачайте SSH.apk на телефон и откройте его. iPhone: SSH.ipa." && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
