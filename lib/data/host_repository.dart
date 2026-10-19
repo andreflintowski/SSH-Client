@@ -15,10 +15,19 @@ class HostRepository extends ChangeNotifier {
 
   List<Host> get hosts => List.unmodifiable(_hosts);
 
+  /// Set when the saved host list could not be read.
+  String? loadError;
+
   Future<void> load() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_prefsKey);
-    _hosts = raw == null ? [] : Host.decodeList(raw);
+    try {
+      final prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(seconds: 10));
+      final raw = prefs.getString(_prefsKey);
+      _hosts = raw == null ? [] : Host.decodeList(raw);
+      loadError = null;
+    } catch (e) {
+      loadError = '$e';
+    }
     notifyListeners();
   }
 
