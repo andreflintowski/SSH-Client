@@ -74,26 +74,49 @@ jobs:
                    "attributes": {"usesNonExemptEncryption": False}}})
               print("::notice::Answered the encryption question")
 
-          groups = call("GET", f"/apps/{app}/betaGroups")["data"]
-          group = next((g for g in groups if g["attributes"]["isInternalGroup"]), None)
-          if group is None:
-              group = call("POST", "/betaGroups", {"data": {"type": "betaGroups",
-                  "attributes": {"name": GROUP, "isInternalGroup": True, "hasAccessToAllBuilds": True},
-                  "relationships": {"app": {"data": {"type": "apps", "id": app}}}}})["data"]
-              print(f"::notice::Created internal group {group['attributes']['name']}")
-          else:
-              print(f"::notice::Internal group: {group['attributes']['name']}")
+          detail = call("GET", f"/builds/{build['id']}/buildBetaDetail")["data"]["attributes"]
+          print(f"::notice::Build beta state: internal={detail.get('internalBuildState')} external={detail.get('externalBuildState')}")
 
+          groups = call("GET", f"/apps/{app}/betaGroups")["data"]
+          internal = [g for g in groups if g["attributes"]["isInternalGroup"]]
+          if not internal:
+              internal = [call("POST", "/betaGroups", {"data": {"type": "betaGroups",
+                  "attributes": {"name": GROUP, "isInternalGroup": True, "hasAccessToAllBuilds": True},
+                  "relationships": {"app": {"data": {"type": "apps", "id": app}}}}})["data"]]
+              print(f"::notice::Created internal group {GROUP}")
           users = call("GET", "/users?limit=200")["data"]
-          owner = next((u for u in users if "ACCOUNT_HOLDER" in u["attributes"]["roles"]), users[0])
-          email = owner["attributes"]["username"]
-          testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
-          if any(t["attributes"].get("email", "").lower() == email.lower() for t in testers):
-              print("::notice::Account holder is already a tester")
-          else:
-              call("POST", "/betaTesters", {"data": {"type": "betaTesters",
-                  "attributes": {"email": email, "firstName": owner["attributes"]["firstName"],
-                                 "lastName": owner["attributes"]["lastName"]},
-                  "relationships": {"betaGroups": {"data": [{"type": "betaGroups", "id": group["id"]}]}}}})
-              print("::notice::Added the account holder as a tester")
+          for u in users:
+              a = u["attributes"]
+              print(f"::notice::User {a['username']} roles={','.join(a['roles'])}")
+
+          for group in internal:
+              ga = group["attributes"]
+              # A group without automatic access only sees builds added to it.
+              if not ga.get("hasAccessToAllBuilds"):
+                  gb = call("GET", f"/betaGroups/{group['id']}/builds?limit=200")["data"]
+                  if not any(b["id"] == build["id"] for b in gb):
+                      call("POST", f"/betaGroups/{group['id']}/relationships/builds",
+                           {"data": [{"type": "builds", "id": build["id"]}]})
+                      print(f"::notice::Added build to group {ga['name']}")
+              testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
+              have = {t["attributes"].get("email", "").lower() for t in testers}
+              for u in users:
+                  a = u["attributes"]
+                  if a["username"].lower() not in have:
+                      call("POST", "/betaTesters", {"data": {"type": "betaTesters",
+                          "attributes": {"email": a["username"], "firstName": a["firstName"], "lastName": a["lastName"]},
+                          "relationships": {"betaGroups": {"data": [{"type": "betaGroups", "id": group["id"]}]}}}})
+                      print(f"::notice::Added tester {a['username']} to {ga['name']}")
+              testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
+              for t in testers:
+                  ta = t["attributes"]
+                  print(f"::notice::Group {ga['name']} (all builds: {ga.get('hasAccessToAllBuilds')}) tester {ta.get('email')} state={ta.get('state')}")
+                  # Re-send the TestFlight invite email.
+                  try:
+                      call("POST", "/betaTesterInvitations", {"data": {"type": "betaTesterInvitations", "relationships": {
+                          "app": {"data": {"type": "apps", "id": app}},
+                          "betaTester": {"data": {"type": "betaTesters", "id": t["id"]}}}}})
+                      print(f"::notice::Sent invite to {ta.get('email')}")
+                  except SystemExit:
+                      pass
           PY
