@@ -1,0 +1,97 @@
+name: TestFlight testers
+
+# Makes the latest TestFlight build installable: waits for Apple to process it,
+# answers the encryption question, and adds the account holder as an internal tester.
+on:
+  workflow_dispatch:
+
+jobs:
+  testers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+    steps:
+      - name: Set up testers
+        run: |
+          python3 -m pip install --quiet --break-system-packages pyjwt cryptography
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error, jwt
+
+          API = "https://api.appstoreconnect.apple.com/v1"
+          BUNDLE = "dev.andre.sshClient"
+          GROUP = "Я"
+
+          def token():
+              now = int(time.time())
+              return jwt.encode({"iss": os.environ["ISSUER_ID"].strip(), "iat": now, "exp": now + 600,
+                                 "aud": "appstoreconnect-v1"},
+                                os.environ["KEY_P8"], algorithm="ES256", headers={"kid": os.environ["KEY_ID"].strip()})
+
+          def call(method, path, body=None):
+              req = urllib.request.Request(API + path, method=method,
+                                           data=json.dumps(body).encode() if body else None,
+                                           headers={"Authorization": f"Bearer {token()}",
+                                                    "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      raw = r.read()
+                      return json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as e:
+                  print(f"::error::{method} {path} -> {e.code}: {' '.join(e.read().decode().split())[:400]}")
+                  raise SystemExit(1)
+
+          apps = call("GET", f"/apps?filter[bundleId]={BUNDLE}")["data"]
+          if not apps:
+              print(f"::error::No App Store Connect app for {BUNDLE}")
+              raise SystemExit(1)
+          app = apps[0]["id"]
+          print(f"::notice::App: {apps[0]['attributes']['name']}")
+
+          # Wait for Apple to finish processing the newest build.
+          for _ in range(50):
+              builds = call("GET", f"/builds?filter[app]={app}&sort=-uploadedDate&limit=1")["data"]
+              if builds and builds[0]["attributes"]["processingState"] != "PROCESSING":
+                  break
+              print("Build still processing" if builds else "No build yet")
+              time.sleep(60)
+          if not builds:
+              print("::error::Apple has no build for this app yet")
+              raise SystemExit(1)
+          build = builds[0]
+          attrs = build["attributes"]
+          print(f"::notice::Build {attrs['version']} state: {attrs['processingState']}")
+          if attrs["processingState"] != "VALID":
+              raise SystemExit(1)
+
+          # The app only uses standard SSH encryption, which is exempt.
+          if attrs.get("usesNonExemptEncryption") is None:
+              call("PATCH", f"/builds/{build['id']}", {"data": {"type": "builds", "id": build["id"],
+                   "attributes": {"usesNonExemptEncryption": False}}})
+              print("::notice::Answered the encryption question")
+
+          groups = call("GET", f"/apps/{app}/betaGroups")["data"]
+          group = next((g for g in groups if g["attributes"]["isInternalGroup"]), None)
+          if group is None:
+              group = call("POST", "/betaGroups", {"data": {"type": "betaGroups",
+                  "attributes": {"name": GROUP, "isInternalGroup": True, "hasAccessToAllBuilds": True},
+                  "relationships": {"app": {"data": {"type": "apps", "id": app}}}}})["data"]
+              print(f"::notice::Created internal group {group['attributes']['name']}")
+          else:
+              print(f"::notice::Internal group: {group['attributes']['name']}")
+
+          users = call("GET", "/users?limit=200")["data"]
+          owner = next((u for u in users if "ACCOUNT_HOLDER" in u["attributes"]["roles"]), users[0])
+          email = owner["attributes"]["username"]
+          testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
+          if any(t["attributes"].get("email", "").lower() == email.lower() for t in testers):
+              print("::notice::Account holder is already a tester")
+          else:
+              call("POST", "/betaTesters", {"data": {"type": "betaTesters",
+                  "attributes": {"email": email, "firstName": owner["attributes"]["firstName"],
+                                 "lastName": owner["attributes"]["lastName"]},
+                  "relationships": {"betaGroups": {"data": [{"type": "betaGroups", "id": group["id"]}]}}}})
+              print("::notice::Added the account holder as a tester")
+          PY
