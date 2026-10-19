@@ -104,7 +104,7 @@ jobs:
           try:
               print(f"::notice::App Store Connect API answered {urllib.request.urlopen(req).status}")
           except urllib.error.HTTPError as e:
-              print(f"::error::App Store Connect API answered {e.code}: {e.read().decode()[:300]}")
+              print(f"::error::App Store Connect API answered {e.code}: {" ".join(e.read().decode().split())[:300]}")
               raise SystemExit(1)
           PY
       - if: steps.check.outputs.ready == 'true'
@@ -143,6 +143,10 @@ jobs:
   release:
     needs: [android, ios]
     runs-on: ubuntu-latest
+    # Runs replace the same release, so they must not overlap.
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
