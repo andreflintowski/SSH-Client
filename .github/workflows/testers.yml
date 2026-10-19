@@ -4,6 +4,8 @@ name: TestFlight testers
 # answers the encryption question, and adds the account holder as an internal tester.
 on:
   workflow_dispatch:
+  push:
+    paths: [.github/workflows/testers.yml]
 
 jobs:
   testers:
