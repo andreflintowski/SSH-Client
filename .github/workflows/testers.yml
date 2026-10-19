@@ -1,0 +1,122 @@
+name: TestFlight testers
+
+# Makes the latest TestFlight build installable: waits for Apple to process it,
+# answers the encryption question, and adds the account holder as an internal tester.
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/testers.yml]
+
+jobs:
+  testers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+    steps:
+      - name: Set up testers
+        run: |
+          python3 -m pip install --quiet --break-system-packages pyjwt cryptography
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error, jwt
+
+          API = "https://api.appstoreconnect.apple.com/v1"
+          BUNDLE = "dev.andre.sshClient"
+          GROUP = "Я"
+
+          def token():
+              now = int(time.time())
+              return jwt.encode({"iss": os.environ["ISSUER_ID"].strip(), "iat": now, "exp": now + 600,
+                                 "aud": "appstoreconnect-v1"},
+                                os.environ["KEY_P8"], algorithm="ES256", headers={"kid": os.environ["KEY_ID"].strip()})
+
+          def call(method, path, body=None):
+              req = urllib.request.Request(API + path, method=method,
+                                           data=json.dumps(body).encode() if body else None,
+                                           headers={"Authorization": f"Bearer {token()}",
+                                                    "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      raw = r.read()
+                      return json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as e:
+                  print(f"::error::{method} {path} -> {e.code}: {' '.join(e.read().decode().split())[:400]}")
+                  raise SystemExit(1)
+
+          apps = call("GET", f"/apps?filter[bundleId]={BUNDLE}")["data"]
+          if not apps:
+              print(f"::error::No App Store Connect app for {BUNDLE}")
+              raise SystemExit(1)
+          app = apps[0]["id"]
+          print(f"::notice::App: {apps[0]['attributes']['name']}")
+
+          # Wait for Apple to finish processing the newest build.
+          for _ in range(50):
+              builds = call("GET", f"/builds?filter[app]={app}&sort=-uploadedDate&limit=1")["data"]
+              if builds and builds[0]["attributes"]["processingState"] != "PROCESSING":
+                  break
+              print("Build still processing" if builds else "No build yet")
+              time.sleep(60)
+          if not builds:
+              print("::error::Apple has no build for this app yet")
+              raise SystemExit(1)
+          build = builds[0]
+          attrs = build["attributes"]
+          print(f"::notice::Build {attrs['version']} state: {attrs['processingState']}")
+          if attrs["processingState"] != "VALID":
+              raise SystemExit(1)
+
+          # The app only uses standard SSH encryption, which is exempt.
+          if attrs.get("usesNonExemptEncryption") is None:
+              call("PATCH", f"/builds/{build['id']}", {"data": {"type": "builds", "id": build["id"],
+                   "attributes": {"usesNonExemptEncryption": False}}})
+              print("::notice::Answered the encryption question")
+
+          detail = call("GET", f"/builds/{build['id']}/buildBetaDetail")["data"]["attributes"]
+          print(f"::notice::Build beta state: internal={detail.get('internalBuildState')} external={detail.get('externalBuildState')}")
+
+          groups = call("GET", f"/apps/{app}/betaGroups")["data"]
+          internal = [g for g in groups if g["attributes"]["isInternalGroup"]]
+          if not internal:
+              internal = [call("POST", "/betaGroups", {"data": {"type": "betaGroups",
+                  "attributes": {"name": GROUP, "isInternalGroup": True, "hasAccessToAllBuilds": True},
+                  "relationships": {"app": {"data": {"type": "apps", "id": app}}}}})["data"]]
+              print(f"::notice::Created internal group {GROUP}")
+          users = call("GET", "/users?limit=200")["data"]
+          for u in users:
+              a = u["attributes"]
+              print(f"::notice::User roles={','.join(a['roles'])}")
+
+          for group in internal:
+              ga = group["attributes"]
+              # A group without automatic access only sees builds added to it.
+              if not ga.get("hasAccessToAllBuilds"):
+                  gb = call("GET", f"/betaGroups/{group['id']}/builds?limit=200")["data"]
+                  if not any(b["id"] == build["id"] for b in gb):
+                      call("POST", f"/betaGroups/{group['id']}/relationships/builds",
+                           {"data": [{"type": "builds", "id": build["id"]}]})
+                      print("::notice::Added build to internal group")
+              testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
+              have = {t["attributes"].get("email", "").lower() for t in testers}
+              for u in users:
+                  a = u["attributes"]
+                  if a["username"].lower() not in have:
+                      call("POST", "/betaTesters", {"data": {"type": "betaTesters",
+                          "attributes": {"email": a["username"], "firstName": a["firstName"], "lastName": a["lastName"]},
+                          "relationships": {"betaGroups": {"data": [{"type": "betaGroups", "id": group["id"]}]}}}})
+                      print("::notice::Added a tester")
+              testers = call("GET", f"/betaGroups/{group['id']}/betaTesters?limit=200")["data"]
+              for t in testers:
+                  ta = t["attributes"]
+                  print(f"::notice::Internal group (all builds: {ga.get('hasAccessToAllBuilds')}) tester state={ta.get('state')}")
+                  # Re-send the TestFlight invite email.
+                  try:
+                      call("POST", "/betaTesterInvitations", {"data": {"type": "betaTesterInvitations", "relationships": {
+                          "app": {"data": {"type": "apps", "id": app}},
+                          "betaTester": {"data": {"type": "betaTesters", "id": t["id"]}}}}})
+                      print("::notice::Sent invite")
+                  except SystemExit:
+                      pass
+          PY

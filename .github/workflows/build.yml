@@ -1,0 +1,189 @@
+name: Build apps
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      - run: flutter build apk --release
+      - run: cp build/app/outputs/flutter-apk/app-release.apk SSH.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SSH-android
+          path: SSH.apk
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      # Unsigned build; it is signed on install (Sideloadly/AltStore) or via TestFlight later.
+      - run: flutter build ios --release --no-codesign
+      - run: |
+          mkdir Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qr SSH.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SSH-ios
+          path: SSH.ipa
+
+  # Signs with the Apple developer account and uploads to TestFlight.
+  # Needs repo secrets APPSTORE_KEY_ID, APPSTORE_ISSUER_ID, APPSTORE_KEY_P8, APPLE_TEAM_ID.
+  testflight:
+    runs-on: macos-latest
+    env:
+      KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Check Apple secrets
+        id: check
+        run: |
+          if [ -z "$KEY_ID" ] || [ -z "$ISSUER_ID" ] || [ -z "$KEY_P8" ] || [ -z "$TEAM_ID" ]; then
+            echo "::notice::Apple secrets are not set, skipping TestFlight upload"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.check.outputs.ready == 'true'
+        uses: actions/checkout@v4
+      - if: steps.check.outputs.ready == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+          cache: true
+      - if: steps.check.outputs.ready == 'true'
+        run: |
+          trap 'tail -15 "$RUNNER_TEMP/config.log" | sed "s/^/::error::/"' ERR
+          set -o pipefail
+          flutter pub get 2>&1 | tee "$RUNNER_TEMP/config.log"
+          flutter build ios --release --config-only --no-codesign --build-number="$GITHUB_RUN_NUMBER" 2>&1 | tee -a "$RUNNER_TEMP/config.log"
+      - if: steps.check.outputs.ready == 'true'
+        name: Check Apple key
+        run: |
+          # Reports only the shape of the secrets and the API status, never their values.
+          python3 -m pip install --quiet --break-system-packages pyjwt cryptography
+          python3 - <<'PY'
+          import os, re, time, urllib.request, urllib.error, jwt
+          kid, iss, p8 = os.environ["KEY_ID"].strip(), os.environ["ISSUER_ID"].strip(), os.environ["KEY_P8"]
+          print(f"::notice::Key ID looks valid: {bool(re.fullmatch(r'[A-Z0-9]{10}', kid))}")
+          print(f"::notice::Issuer ID looks like a UUID: {bool(re.fullmatch(r'[0-9a-f-]{36}', iss))}")
+          print(f"::notice::Key file has PEM header: {'BEGIN PRIVATE KEY' in p8}")
+          try:
+              token = jwt.encode({"iss": iss, "iat": int(time.time()), "exp": int(time.time()) + 600, "aud": "appstoreconnect-v1"},
+                                 p8, algorithm="ES256", headers={"kid": kid})
+          except Exception as e:
+              print(f"::error::Key file could not be read as a private key: {type(e).__name__}")
+              raise SystemExit(1)
+          req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/bundleIds?limit=1",
+                                       headers={"Authorization": f"Bearer {token}"})
+          try:
+              print(f"::notice::App Store Connect API answered {urllib.request.urlopen(req).status}")
+          except urllib.error.HTTPError as e:
+              print(f"::error::App Store Connect API answered {e.code}: {" ".join(e.read().decode().split())[:300]}")
+              raise SystemExit(1)
+          # Register the bundle ID so the app can be created in App Store Connect.
+          import json
+          bundle = "dev.andre.sshClient"
+          auth = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+          found = json.load(urllib.request.urlopen(urllib.request.Request(
+              f"https://api.appstoreconnect.apple.com/v1/bundleIds?filter[identifier]={bundle}", headers=auth)))["data"]
+          if any(b["attributes"]["identifier"] == bundle for b in found):
+              print(f"::notice::Bundle ID {bundle} is registered")
+          else:
+              body = json.dumps({"data": {"type": "bundleIds", "attributes": {
+                  "identifier": bundle, "name": "SSH Andre", "platform": "IOS"}}}).encode()
+              try:
+                  urllib.request.urlopen(urllib.request.Request(
+                      "https://api.appstoreconnect.apple.com/v1/bundleIds", data=body, headers=auth, method="POST"))
+                  print(f"::notice::Registered bundle ID {bundle}")
+              except urllib.error.HTTPError as e:
+                  # Keys without Admin access can't register it; the owner does it once by hand.
+                  print(f"::warning::Could not register bundle ID {bundle}: {e.code}")
+          PY
+      - if: steps.check.outputs.ready == 'true'
+        name: Archive and upload
+        run: |
+          # The archive stays unsigned; export signs it with Apple's cloud-managed
+          # distribution certificate, so runs don't each create a certificate.
+          # Surface xcodebuild errors as annotations, readable without the raw log.
+          trap 'cat "$RUNNER_TEMP"/*.log 2>/dev/null | grep -v "^ *export " | grep -E "error:|Error Domain|No profiles|No signing|requires a provisioning|\*\* .* FAILED" | tail -9 | sed "s/^/::error::/"' ERR
+          set -o pipefail
+          KEY_PATH="$RUNNER_TEMP/AuthKey_$KEY_ID.p8"
+          printf '%s' "$KEY_P8" > "$KEY_PATH"
+          AUTH=(-allowProvisioningUpdates
+                -authenticationKeyPath "$KEY_PATH"
+                -authenticationKeyID "$KEY_ID"
+                -authenticationKeyIssuerID "$ISSUER_ID")
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner \
+            -configuration Release -destination generic/platform=iOS \
+            -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGNING_ALLOWED=NO \
+            archive 2>&1 | tee "$RUNNER_TEMP/archive.log"
+          cat > "$RUNNER_TEMP/export.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export.plist" \
+            -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}" 2>&1 | tee "$RUNNER_TEMP/export.log"
+          rm -f "$KEY_PATH"
+
+  # One fixed download page: github.com/<repo>/releases/latest
+  release:
+    needs: [android, ios]
+    runs-on: ubuntu-latest
+    # Runs replace the same release, so they must not overlap.
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          # The deleted tag can linger for a moment, so retry the create.
+          for i in 1 2 3 4 5; do
+            gh release create latest SSH.apk SSH.ipa \
+              --target "$GITHUB_SHA" \
+              --title "SSH (сборка ${GITHUB_RUN_NUMBER})" \
+              --notes "Android: скачайте SSH.apk на телефон и откройте его. iPhone: SSH.ipa." && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
