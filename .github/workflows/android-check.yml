@@ -1,0 +1,44 @@
+name: Android launch check
+
+# Installs the published APK on an emulator, opens it and reports what the app logs.
+on:
+  push:
+    paths: ['.github/workflows/android-check.yml']
+  workflow_dispatch:
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Download APK
+        run: curl -fsSL -o SSH.apk "https://github.com/${{ github.repository }}/releases/download/latest/SSH.apk"
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            adb install -r SSH.apk
+            adb logcat -c
+            adb shell monkey -p dev.andre.ssh_client -c android.intent.category.LAUNCHER 1
+            sleep 40
+            adb logcat -d > logcat.txt || true
+            adb shell dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' > focus.txt || true
+            adb shell pidof dev.andre.ssh_client > pid.txt || echo none > pid.txt
+            adb exec-out uiautomator dump /dev/tty > ui.txt 2>/dev/null || true
+      - name: Report
+        if: always()
+        run: |
+          echo "::notice::pid=$(cat pid.txt 2>/dev/null) focus=$(tr '\n' ' ' < focus.txt 2>/dev/null)"
+          grep -o 'text="[^"]*"' ui.txt 2>/dev/null | sort -u | head -20 | tr '\n' ' ' | sed 's/^/::notice::ui /'; echo
+          grep -E ' (E|F) |flutter|AndroidRuntime|FATAL|Exception' logcat.txt | grep -v -E 'chatty|GoogleApiManager|Finsky|gms' | tail -40 | while IFS= read -r l; do echo "::warning::$l"; done
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logcat
+          path: '*.txt'
