@@ -83,6 +83,31 @@ jobs:
           flutter pub get 2>&1 | tee "$RUNNER_TEMP/config.log"
           flutter build ios --release --config-only --no-codesign --build-number="$GITHUB_RUN_NUMBER" 2>&1 | tee -a "$RUNNER_TEMP/config.log"
       - if: steps.check.outputs.ready == 'true'
+        name: Check Apple key
+        run: |
+          # Reports only the shape of the secrets and the API status, never their values.
+          python3 -m pip install --quiet --break-system-packages pyjwt cryptography
+          python3 - <<'PY'
+          import os, re, time, urllib.request, urllib.error, jwt
+          kid, iss, p8 = os.environ["KEY_ID"].strip(), os.environ["ISSUER_ID"].strip(), os.environ["KEY_P8"]
+          print(f"::notice::Key ID looks valid: {bool(re.fullmatch(r'[A-Z0-9]{10}', kid))}")
+          print(f"::notice::Issuer ID looks like a UUID: {bool(re.fullmatch(r'[0-9a-f-]{36}', iss))}")
+          print(f"::notice::Key file has PEM header: {'BEGIN PRIVATE KEY' in p8}")
+          try:
+              token = jwt.encode({"iss": iss, "iat": int(time.time()), "exp": int(time.time()) + 600, "aud": "appstoreconnect-v1"},
+                                 p8, algorithm="ES256", headers={"kid": kid})
+          except Exception as e:
+              print(f"::error::Key file could not be read as a private key: {type(e).__name__}")
+              raise SystemExit(1)
+          req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/bundleIds?limit=1",
+                                       headers={"Authorization": f"Bearer {token}"})
+          try:
+              print(f"::notice::App Store Connect API answered {urllib.request.urlopen(req).status}")
+          except urllib.error.HTTPError as e:
+              print(f"::error::App Store Connect API answered {e.code}: {e.read().decode()[:300]}")
+              raise SystemExit(1)
+          PY
+      - if: steps.check.outputs.ready == 'true'
         name: Archive and upload
         run: |
           # Surface xcodebuild errors as annotations, readable without the raw log.
