@@ -12,4 +12,5 @@ echo "${pid:-none}" > pid.txt
 [ -n "$pid" ] && adb logcat -d --pid="$pid" > applog.txt 2>&1
 adb logcat -d | grep -i -E 'flutter|AndroidRuntime|ssh_client' > flutter.txt
 adb shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1; adb shell cat /sdcard/ui.xml > ui.txt 2>&1
+adb exec-out screencap -p > screen.png 2>/dev/null
 exit 0

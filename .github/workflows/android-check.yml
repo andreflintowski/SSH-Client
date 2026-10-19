@@ -44,6 +44,13 @@ jobs:
           echo "::notice::pid=$(cat pid.txt 2>/dev/null) focus=$(tr '\n' ' ' < focus.txt 2>/dev/null)"
           grep -o 'text="[^"]*"' ui.txt 2>/dev/null | sort -u | head -20 | tr '\n' ' ' | sed 's/^/::notice::ui /'; echo
           cat applog.txt flutter.txt 2>/dev/null | grep -v -E '^-----|chatty' | sort -u | tail -45 | while IFS= read -r l; do echo "::warning::$l"; done
+      - name: Full app log
+        if: always()
+        run: |
+          echo "=== applog"; cat applog.txt 2>/dev/null
+          echo "=== flutter"; cat flutter.txt 2>/dev/null
+          echo "=== ui"; cat ui.txt 2>/dev/null; echo
+          echo "=== screen"; gzip -9c screen.png 2>/dev/null | base64 -w0; echo; echo "=== end"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
