@@ -79,7 +79,7 @@ jobs:
       - if: steps.check.outputs.ready == 'true'
         run: |
           flutter pub get
-          flutter build ios --release --config-only --build-number="$GITHUB_RUN_NUMBER"
+          flutter build ios --release --config-only --no-codesign --build-number="$GITHUB_RUN_NUMBER"
       - if: steps.check.outputs.ready == 'true'
         name: Archive and upload
         run: |
