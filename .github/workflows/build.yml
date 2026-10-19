@@ -122,8 +122,8 @@ jobs:
                       "https://api.appstoreconnect.apple.com/v1/bundleIds", data=body, headers=auth, method="POST"))
                   print(f"::notice::Registered bundle ID {bundle}")
               except urllib.error.HTTPError as e:
-                  print(f"::error::Could not register bundle ID: {e.code} {" ".join(e.read().decode().split())[:300]}")
-                  raise SystemExit(1)
+                  # Keys without Admin access can't register it; the owner does it once by hand.
+                  print(f"::warning::Could not register bundle ID {bundle}: {e.code}")
           PY
       - if: steps.check.outputs.ready == 'true'
         name: Archive and upload
