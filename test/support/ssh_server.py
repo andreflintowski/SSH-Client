@@ -26,6 +26,11 @@ class Shell(asyncssh.SSHServerSession):
         self.master, slave = pty.openpty()
         self.resize()
         def setup():
+            # CI starts the fixture in the background, where SIGINT/SIGQUIT
+            # may be inherited as ignored. Give its interactive PTY shell
+            # normal signal dispositions before exec (including child jobs).
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGQUIT, signal.SIG_DFL)
             os.setsid()
             fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
         self.proc = subprocess.Popen(['/bin/bash','--noprofile','--norc','-i'], stdin=slave, stdout=slave, stderr=slave,
