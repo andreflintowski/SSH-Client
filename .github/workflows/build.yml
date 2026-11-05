@@ -19,6 +19,10 @@ on:
         description: 'Optional existing build number to inspect during diagnostics'
         type: string
         default: ''
+      signing_csr:
+        description: 'Public CSR only: provision a dedicated CI distribution certificate without uploading'
+        type: string
+        default: ''
       expected_sha:
         description: 'Full validated commit SHA required for a TestFlight upload'
         type: string
@@ -30,7 +34,7 @@ permissions:
 
 jobs:
   android:
-    if: github.event_name != 'workflow_dispatch' || (!inputs.upload_testflight && !inputs.diagnose_only)
+    if: github.event_name != 'workflow_dispatch' || (!inputs.upload_testflight && !inputs.diagnose_only && inputs.signing_csr == '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +77,7 @@ jobs:
           path: SSH.apk
 
   ios:
-    if: github.event_name != 'workflow_dispatch' || (!inputs.upload_testflight && !inputs.diagnose_only)
+    if: github.event_name != 'workflow_dispatch' || (!inputs.upload_testflight && !inputs.diagnose_only && inputs.signing_csr == '')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -97,13 +101,16 @@ jobs:
   # Signs with the Apple developer account and uploads to TestFlight.
   # Needs repo secrets APPSTORE_KEY_ID, APPSTORE_ISSUER_ID, APPSTORE_KEY_P8, APPLE_TEAM_ID.
   testflight:
-    if: (github.ref == 'refs/heads/initial-mvp' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.upload_testflight && !inputs.diagnose_only)
+    if: (github.ref == 'refs/heads/initial-mvp' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.upload_testflight && !inputs.diagnose_only && inputs.signing_csr == '')
     runs-on: macos-latest
     env:
       KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
       ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
       KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
       TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      IOS_DISTRIBUTION_P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
+      IOS_DISTRIBUTION_P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
+      IOS_DISTRIBUTION_CERT_ID: ${{ secrets.IOS_DISTRIBUTION_CERT_ID }}
     steps:
       - name: Verify explicitly requested source commit
         if: github.event_name == 'workflow_dispatch'
@@ -207,8 +214,7 @@ jobs:
       - if: steps.check.outputs.ready == 'true'
         name: Archive and upload
         run: |
-          # The archive stays unsigned; export signs it with Apple's cloud-managed
-          # distribution certificate, so runs don't each create a certificate.
+          # Export uses a dedicated CI identity to avoid cloud signing failures.
           # Surface xcodebuild errors as annotations, readable without the raw log.
           trap 'cat "$RUNNER_TEMP"/*.log 2>/dev/null | grep -v "^ *export " | grep -E "error:|Error Domain|No profiles|No signing|requires a provisioning|\*\* .* FAILED" | tail -9 | sed "s/^/::error::/"; python3 .github/scripts/signing_diagnostics.py' ERR
           set -o pipefail
@@ -223,17 +229,27 @@ jobs:
             -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGNING_ALLOWED=NO \
             archive 2>&1 | tee "$RUNNER_TEMP/archive.log"
-          cat > "$RUNNER_TEMP/export.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>method</key><string>app-store-connect</string>
-            <key>destination</key><string>upload</string>
-            <key>teamID</key><string>$TEAM_ID</string>
-            <key>signingStyle</key><string>automatic</string>
-            <key>manageAppVersionAndBuildNumber</key><false/>
-          </dict></plist>
-          PLIST
+          test -n "$IOS_DISTRIBUTION_P12"
+          test -n "$IOS_DISTRIBUTION_P12_PASSWORD"
+          test -n "$IOS_DISTRIBUTION_CERT_ID"
+          python3 .github/scripts/provision_signing.py
+          python3 - <<'PY12'
+          import base64, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP']) / 'distribution.p12'
+          p.write_bytes(base64.b64decode(os.environ['IOS_DISTRIBUTION_P12']))
+          p.chmod(0o600)
+          PY12
+          KEYCHAIN_PATH="$RUNNER_TEMP/ssh-distribution.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/distribution.p12" -P "$IOS_DISTRIBUTION_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          rm -f "$RUNNER_TEMP/distribution.p12"
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export.plist" \
             -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}" 2>&1 | tee "$RUNNER_TEMP/export.log"
@@ -241,6 +257,37 @@ jobs:
       - if: steps.check.outputs.ready == 'true'
         name: Verify this build in TestFlight
         run: python3 .github/scripts/verify_testflight.py
+      - if: always()
+        name: Remove temporary signing material
+        run: |
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/distribution.p12"
+          if [ -f "$RUNNER_TEMP/ssh-distribution.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/ssh-distribution.keychain-db"
+          fi
+
+  provision-signing:
+    if: github.event_name == 'workflow_dispatch' && inputs.signing_csr != '' && !inputs.upload_testflight && !inputs.diagnose_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+      SIGNING_CSR: ${{ inputs.signing_csr }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+    steps:
+      - run: test -n "$EXPECTED_SHA" && test "$GITHUB_SHA" = "$EXPECTED_SHA"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyjwt cryptography
+      - run: python .github/scripts/provision_signing.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SSH-signing-public
+          path: ${{ runner.temp }}/ssh-signing-public
+          retention-days: 1
 
   signing-diagnostics:
     if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only
