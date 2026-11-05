@@ -44,6 +44,24 @@ Future<void> until(bool Function() ready) async {
   throw StateError('Timed out waiting for SSH state');
 }
 
+Future<void> terminalUntil(SshSession s, bool Function() ready, String stage) async {
+  try {
+    await until(ready);
+  } catch (_) {
+    throw StateError('Timed out at $stage. Terminal output:\n${s.terminal.buffer.getText()}');
+  }
+}
+
+Future<void> shellPrompt(SshSession s, {int? after}) => terminalUntil(
+  s,
+  () {
+    final text = s.terminal.buffer.getText();
+    return text.trimRight().endsWith('AUDIT>') &&
+        (after == null || RegExp('AUDIT>').allMatches(text).length > after);
+  },
+  'shell prompt',
+);
+
 Future<void> finish(SshSession s) async {
   if (s.state == SessionState.connected) {
     s.send('exit\r');
@@ -245,22 +263,30 @@ void main() {
               ),
               credentials: credentials,
             );
+            addTearDown(s.dispose);
             s.terminal.resize(80, 24);
             await s.connect();
             expect(s.state, SessionState.connected, reason: s.error);
+            await shellPrompt(s);
             s.send("printf '\\033[31mПроверка-✓\\033[0m\\n'; stty size\r");
-            await until(() => s.terminal.buffer.getText().contains('24 80'));
+            await terminalUntil(s, () => s.terminal.buffer.getText().contains('24 80'), 'initial PTY size');
+            await shellPrompt(s);
             expect(s.terminal.buffer.getText(), contains('Проверка-✓'));
             s.terminal.resize(100, 30);
             s.send('stty size\r');
-            await until(() => s.terminal.buffer.getText().contains('30 100'));
-            s.send('sleep 10\r');
-            await Future<void>.delayed(const Duration(milliseconds: 100));
+            await terminalUntil(s, () => s.terminal.buffer.getText().contains('30 100'), 'resized PTY size');
+            await shellPrompt(s);
+            final prompts = RegExp('AUDIT>').allMatches(s.terminal.buffer.getText()).length;
+            s.send("printf 'CTRL_READY\\n'; sleep 10\r");
+            await terminalUntil(s, () => s.terminal.buffer.getText().contains('CTRL_READY\n'), 'foreground command readiness');
             s.toggleCtrl();
             s.send('c');
+            // A Unix PTY may flush input queued with SIGINT. Wait for the shell
+            // before sending the next command, as an interactive user would.
+            await shellPrompt(s, after: prompts);
             s.send("printf 'CTRL_OK\\n'\r");
-            await until(
-              () => s.terminal.buffer.getText().contains('CTRL_OK\n'),
+            await terminalUntil(
+              s, () => s.terminal.buffer.getText().contains('CTRL_OK\n'), 'command after Ctrl-C',
             );
             expect(s.ctrlArmed, isFalse);
             await finish(s);
