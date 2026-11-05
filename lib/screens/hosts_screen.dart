@@ -14,13 +14,38 @@ class HostsScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Hosts')),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () => _edit(context, null),
-        child: const Icon(Icons.add),
+      floatingActionButton: ListenableBuilder(
+        listenable: repo,
+        builder: (_, _) => FloatingActionButton(
+          onPressed: repo.isLoading || repo.loadError != null
+              ? null
+              : () => _edit(context, null),
+          child: const Icon(Icons.add),
+        ),
       ),
       body: ListenableBuilder(
         listenable: repo,
         builder: (context, _) {
+          if (repo.isLoading) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (repo.loadError != null) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(repo.loadError!),
+                    TextButton(
+                      onPressed: repo.load,
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
           final hosts = repo.hosts;
           if (hosts.isEmpty) {
             return const Center(child: Text('No hosts yet. Tap + to add one.'));
@@ -32,12 +57,15 @@ class HostsScreen extends StatelessWidget {
               final h = hosts[i];
               return ListTile(
                 leading: Icon(
-                    h.auth == AuthMethod.key ? Icons.vpn_key : Icons.password),
+                  h.auth == AuthMethod.key ? Icons.vpn_key : Icons.password,
+                ),
                 title: Text(h.displayName),
                 subtitle: Text('${h.username}@${h.hostname}:${h.port}'),
-                onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                  builder: (_) => TerminalScreen(repo: repo, host: h),
-                )),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => TerminalScreen(repo: repo, host: h),
+                  ),
+                ),
                 trailing: PopupMenuButton<String>(
                   onSelected: (v) {
                     if (v == 'edit') _edit(context, h);
@@ -57,9 +85,11 @@ class HostsScreen extends StatelessWidget {
   }
 
   void _edit(BuildContext context, Host? host) {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => HostEditScreen(repo: repo, host: host),
-    ));
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => HostEditScreen(repo: repo, host: host),
+      ),
+    );
   }
 
   Future<void> _confirmDelete(BuildContext context, Host host) async {
@@ -70,14 +100,28 @@ class HostsScreen extends StatelessWidget {
         content: const Text('Saved password and key will be removed too.'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
           TextButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Delete')),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
         ],
       ),
     );
-    if (ok == true) await repo.delete(host.id);
+    if (ok == true) {
+      try {
+        await repo.delete(host.id);
+      } catch (_) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Could not delete the host. Please try again.'),
+            ),
+          );
+        }
+      }
+    }
   }
 }
