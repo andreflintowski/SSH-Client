@@ -2,10 +2,39 @@ name: Build apps
 
 on:
   push:
+    branches: [initial-mvp]
+  pull_request:
+    branches: [initial-mvp]
   workflow_dispatch:
+    inputs:
+      upload_testflight:
+        description: 'Upload this exact commit to TestFlight after validation'
+        type: boolean
+        default: false
+      diagnose_only:
+        description: 'Read-only Apple signing diagnostics; never upload'
+        type: boolean
+        default: false
+      inspect_build:
+        description: 'Optional existing build number to inspect during diagnostics'
+        type: string
+        default: ''
+      signing_csr:
+        description: 'Public CSR only: provision a dedicated CI distribution certificate without uploading'
+        type: string
+        default: ''
+      expected_sha:
+        description: 'Full validated commit SHA required for a TestFlight upload'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   android:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.upload_testflight && !inputs.diagnose_only && inputs.signing_csr == '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +49,26 @@ jobs:
           cache: true
       - run: flutter pub get
       - run: flutter analyze
-      - run: flutter test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test with disposable loopback SSH server
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s .github/scripts -p 'test_*.py'
+          python -m pip install --quiet asyncssh bcrypt
+          fixture="$RUNNER_TEMP/ssh-regression-fixture"
+          python test/support/ssh_server.py "$fixture" > "$RUNNER_TEMP/ssh-fixture.log" 2>&1 &
+          fixture_pid=$!
+          trap 'kill "$fixture_pid" 2>/dev/null || true; rm -rf "$fixture"' EXIT
+          for attempt in $(seq 1 100); do
+            [ -f "$fixture/config.json" ] && break
+            kill -0 "$fixture_pid" 2>/dev/null || { cat "$RUNNER_TEMP/ssh-fixture.log"; exit 1; }
+            sleep 0.1
+          done
+          test -f "$fixture/config.json"
+          SSH_AUDIT_CONFIG="$fixture/config.json" flutter test --concurrency=1
       - run: flutter build apk --release
       - run: cp build/app/outputs/flutter-apk/app-release.apk SSH.apk
       - uses: actions/upload-artifact@v4
@@ -29,6 +77,7 @@ jobs:
           path: SSH.apk
 
   ios:
+    if: github.event_name != 'workflow_dispatch' || (!inputs.upload_testflight && !inputs.diagnose_only && inputs.signing_csr == '')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,19 +101,43 @@ jobs:
   # Signs with the Apple developer account and uploads to TestFlight.
   # Needs repo secrets APPSTORE_KEY_ID, APPSTORE_ISSUER_ID, APPSTORE_KEY_P8, APPLE_TEAM_ID.
   testflight:
+    if: (github.ref == 'refs/heads/initial-mvp' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.upload_testflight && !inputs.diagnose_only && inputs.signing_csr == '')
     runs-on: macos-latest
     env:
       KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
       ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
       KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
       TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      IOS_DISTRIBUTION_P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
+      IOS_DISTRIBUTION_P12_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
+      IOS_DISTRIBUTION_CERT_ID: ${{ secrets.IOS_DISTRIBUTION_CERT_ID }}
     steps:
+      - name: Verify explicitly requested source commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=pull_request -f status=success \
+            > "$RUNNER_TEMP/validated-runs.json"
+          python3 - <<'PY'
+          import json, os
+          with open(os.environ["RUNNER_TEMP"] + "/validated-runs.json") as source:
+              runs = json.load(source)["workflow_runs"]
+          assert any(r["head_sha"] == os.environ["GITHUB_SHA"] and
+                     r["event"] == "pull_request" and r["conclusion"] == "success" and
+                     r["path"] == ".github/workflows/build.yml" for r in runs), "No passing PR CI for this exact SHA"
+          PY
       - name: Check Apple secrets
         id: check
         run: |
           if [ -z "$KEY_ID" ] || [ -z "$ISSUER_ID" ] || [ -z "$KEY_P8" ] || [ -z "$TEAM_ID" ]; then
-            echo "::notice::Apple secrets are not set, skipping TestFlight upload"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Apple secrets are required for the requested TestFlight upload"
+            exit 1
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
@@ -76,12 +149,6 @@ jobs:
           flutter-version: '3.47.7'
           channel: stable
           cache: true
-      - if: steps.check.outputs.ready == 'true'
-        run: |
-          trap 'tail -15 "$RUNNER_TEMP/config.log" | sed "s/^/::error::/"' ERR
-          set -o pipefail
-          flutter pub get 2>&1 | tee "$RUNNER_TEMP/config.log"
-          flutter build ios --release --config-only --no-codesign --build-number="$GITHUB_RUN_NUMBER" 2>&1 | tee -a "$RUNNER_TEMP/config.log"
       - if: steps.check.outputs.ready == 'true'
         name: Check Apple key
         run: |
@@ -124,14 +191,32 @@ jobs:
               except urllib.error.HTTPError as e:
                   # Keys without Admin access can't register it; the owner does it once by hand.
                   print(f"::warning::Could not register bundle ID {bundle}: {e.code}")
+          # Select a number above both the workflow counter and existing builds.
+          apps = json.load(urllib.request.urlopen(urllib.request.Request(
+              f"https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]={bundle}", headers=auth)))["data"]
+          if len(apps) != 1:
+              raise SystemExit("Expected exactly one App Store Connect app")
+          app_id = apps[0]["id"]
+          builds = json.load(urllib.request.urlopen(urllib.request.Request(
+              f"https://api.appstoreconnect.apple.com/v1/builds?filter[app]={app_id}&sort=-uploadedDate&limit=200", headers=auth)))["data"]
+          versions = [int(b["attributes"]["version"]) for b in builds if b["attributes"]["version"].isdigit()]
+          number = max(int(os.environ["GITHUB_RUN_NUMBER"]), max(versions, default=0) + 1)
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"BUILD_NUMBER={number}\n")
+          print(f"::notice::TestFlight source {os.environ['GITHUB_SHA']} build {number}")
           PY
+      - if: steps.check.outputs.ready == 'true'
+        run: |
+          trap 'tail -15 "$RUNNER_TEMP/config.log" | sed "s/^/::error::/"' ERR
+          set -o pipefail
+          flutter pub get 2>&1 | tee "$RUNNER_TEMP/config.log"
+          flutter build ios --release --config-only --no-codesign --build-number="$BUILD_NUMBER" 2>&1 | tee -a "$RUNNER_TEMP/config.log"
       - if: steps.check.outputs.ready == 'true'
         name: Archive and upload
         run: |
-          # The archive stays unsigned; export signs it with Apple's cloud-managed
-          # distribution certificate, so runs don't each create a certificate.
+          # Export uses a dedicated CI identity to avoid cloud signing failures.
           # Surface xcodebuild errors as annotations, readable without the raw log.
-          trap 'cat "$RUNNER_TEMP"/*.log 2>/dev/null | grep -v "^ *export " | grep -E "error:|Error Domain|No profiles|No signing|requires a provisioning|\*\* .* FAILED" | tail -9 | sed "s/^/::error::/"' ERR
+          trap 'cat "$RUNNER_TEMP"/*.log 2>/dev/null | grep -v "^ *export " | grep -E "error:|Error Domain|No profiles|No signing|requires a provisioning|\*\* .* FAILED" | tail -9 | sed "s/^/::error::/"; python3 .github/scripts/signing_diagnostics.py' ERR
           set -o pipefail
           KEY_PATH="$RUNNER_TEMP/AuthKey_$KEY_ID.p8"
           printf '%s' "$KEY_P8" > "$KEY_PATH"
@@ -144,23 +229,89 @@ jobs:
             -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGNING_ALLOWED=NO \
             archive 2>&1 | tee "$RUNNER_TEMP/archive.log"
-          cat > "$RUNNER_TEMP/export.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>method</key><string>app-store-connect</string>
-            <key>destination</key><string>upload</string>
-            <key>teamID</key><string>$TEAM_ID</string>
-            <key>signingStyle</key><string>automatic</string>
-          </dict></plist>
-          PLIST
+          test -n "$IOS_DISTRIBUTION_P12"
+          test -n "$IOS_DISTRIBUTION_P12_PASSWORD"
+          test -n "$IOS_DISTRIBUTION_CERT_ID"
+          python3 .github/scripts/provision_signing.py
+          python3 - <<'PY12'
+          import base64, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP']) / 'distribution.p12'
+          p.write_bytes(base64.b64decode(os.environ['IOS_DISTRIBUTION_P12']))
+          p.chmod(0o600)
+          PY12
+          KEYCHAIN_PATH="$RUNNER_TEMP/ssh-distribution.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/distribution.p12" -P "$IOS_DISTRIBUTION_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          rm -f "$RUNNER_TEMP/distribution.p12"
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export.plist" \
             -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}" 2>&1 | tee "$RUNNER_TEMP/export.log"
           rm -f "$KEY_PATH"
+      - if: steps.check.outputs.ready == 'true'
+        name: Verify this build in TestFlight
+        run: python3 .github/scripts/verify_testflight.py
+      - if: always()
+        name: Remove temporary signing material
+        run: |
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/distribution.p12"
+          if [ -f "$RUNNER_TEMP/ssh-distribution.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/ssh-distribution.keychain-db"
+          fi
+
+  provision-signing:
+    if: github.event_name == 'workflow_dispatch' && inputs.signing_csr != '' && !inputs.upload_testflight && !inputs.diagnose_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+      SIGNING_CSR: ${{ inputs.signing_csr }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+    steps:
+      - run: test -n "$EXPECTED_SHA" && test "$GITHUB_SHA" = "$EXPECTED_SHA"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyjwt cryptography
+      - run: python .github/scripts/provision_signing.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SSH-signing-public
+          path: ${{ runner.temp }}/ssh-signing-public
+          retention-days: 1
+
+  signing-diagnostics:
+    if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+      KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      BUILD_NUMBER: ${{ inputs.inspect_build }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+    steps:
+      - run: test -n "$EXPECTED_SHA" && test "$GITHUB_SHA" = "$EXPECTED_SHA"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyjwt cryptography
+      - run: python .github/scripts/signing_diagnostics.py
 
   # One fixed download page: github.com/<repo>/releases/latest
   release:
+    if: github.ref == 'refs/heads/initial-mvp' && github.event_name == 'push'
     needs: [android, ios]
     runs-on: ubuntu-latest
     # Runs replace the same release, so they must not overlap.

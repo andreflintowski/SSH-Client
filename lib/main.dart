@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'data/host_repository.dart';
@@ -6,8 +8,8 @@ import 'screens/hosts_screen.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final repo = HostRepository();
-  await repo.load();
   runApp(SshApp(repo: repo));
+  unawaited(repo.load());
 }
 
 class SshApp extends StatelessWidget {
